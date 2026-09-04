@@ -131,7 +131,7 @@ RendererVulkan::RendererVulkan(Core::System& system, Pica::PicaCore& pica_,
     BuildPipelines();
     if (secondary_window) {
         secondary_present_window_ptr = std::make_unique<PresentWindow>(
-            *secondary_window, instance, scheduler, IsLowRefreshRate());
+            *secondary_window, instance, scheduler, /*low_refresh_rate=*/true);
     }
 }
 
@@ -149,6 +149,12 @@ RendererVulkan::~RendererVulkan() {
 
     for (auto& sampler : present_samplers) {
         device.destroySampler(sampler);
+        // Thor dual-screen fix: the secondary window must not use a FIFO
+        // swapchain. Both windows are presented serially from the emulation
+        // thread and the two displays' vsyncs are not phase-locked, so a FIFO
+        // secondary stalls GetRenderFrame() and takes video and audio with it.
+        // low_refresh_rate=true routes vk_swapchain.cpp to MAILBOX, which
+        // replaces queued images instead of blocking.
     }
 
     for (auto& info : screen_infos) {
