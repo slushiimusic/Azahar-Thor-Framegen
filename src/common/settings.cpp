@@ -79,6 +79,10 @@ Values values = {};
 static bool configuring_global = true;
 bool is_temporary_frame_limit;
 double temporary_frame_limit;
+// Display-sync override: takes precedence over BOTH the frame_limit setting and
+// the temporary limit, because titles clobber the latter through svc.cpp's
+// frame-limit SVC. 0 = off.
+double display_sync_limit = 0.0;
 
 void LogSettings() {
     const auto log_setting = [](std::string_view name, const auto& value) {

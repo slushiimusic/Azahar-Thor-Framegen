@@ -535,6 +535,10 @@ struct Values {
     SwitchableSetting<bool> spirv_shader_gen{true, Keys::spirv_shader_gen};
     SwitchableSetting<bool> disable_spirv_optimizer{true, Keys::disable_spirv_optimizer};
     SwitchableSetting<bool> async_shader_compilation{false, Keys::async_shader_compilation};
+    // LSFG frame generation. Requires Lossless.dll for shader extraction.
+    SwitchableSetting<bool> frame_generation{false, Keys::frame_generation};
+    // Higher-quality interpolation: anti-artifacts on, performance shader off.
+    SwitchableSetting<bool> frame_gen_quality{false, Keys::frame_gen_quality};
     SwitchableSetting<bool> async_presentation{true, Keys::async_presentation};
     SwitchableSetting<bool> use_hw_shader{true, Keys::use_hw_shader};
     SwitchableSetting<bool> use_disk_shader_cache{true, Keys::use_disk_shader_cache};
@@ -706,11 +710,17 @@ void RenameCurrentProfile(std::string new_name);
 
 extern bool is_temporary_frame_limit;
 extern double temporary_frame_limit;
+extern double display_sync_limit;
 static inline void ResetTemporaryFrameLimit() {
     is_temporary_frame_limit = false;
     temporary_frame_limit = 0;
 }
 static inline double GetFrameLimit() {
+    // Pace to the panel, not to the 3DS. Checked first so a title's frame-limit
+    // SVC cannot reset it mid-game.
+    if (display_sync_limit > 0.0) {
+        return display_sync_limit;
+    }
     return is_temporary_frame_limit ? temporary_frame_limit : values.frame_limit.GetValue();
 }
 

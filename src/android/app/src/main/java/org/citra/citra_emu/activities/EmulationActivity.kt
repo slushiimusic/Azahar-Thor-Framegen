@@ -111,6 +111,15 @@ class EmulationActivity : AppCompatActivity() {
         hotkeyUtility = HotkeyUtility(screenAdjustmentUtil, this)
         setContentView(binding.root)
 
+        // Ask the panel for ~60Hz while emulating, regardless of the system-wide
+        // refresh setting. The Thor's "120Hz" mode actually scans at 118.01Hz, so
+        // half of it is 59.005 -- 1.4% off the 3DS's 59.83 and visibly juddery,
+        // while its "60Hz" mode runs 59.56 and vsync locks to it cleanly. Setting
+        // preferredDisplayModeId scopes the switch to this window, so the system
+        // can stay at 120Hz for everything else.
+        selectSixtyHzMode()
+
+
         val navHostFragment =
             supportFragmentManager.findFragmentById(R.id.fragment_container) as NavHostFragment
         val navController = navHostFragment.navController
@@ -617,4 +626,49 @@ class EmulationActivity : AppCompatActivity() {
 
         fun isRunning(): Boolean = instance?.isEmulationRunning ?: false
     }
+
+    /**
+     * Picks the display mode closest to 60Hz at the current resolution and pins this
+     * window to it. Falls back silently when the panel offers nothing suitable.
+     */
+    private fun selectSixtyHzMode() {
+        try {
+            val display = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                display
+            } else {
+                @Suppress("DEPRECATION") windowManager.defaultDisplay
+            } ?: return
+            val current = display.mode ?: return
+            // Black frame insertion presents twice per game frame, so it needs the
+            // 120Hz mode to still land 60 real frames per second.
+            // Both BFI and frame generation present ~2x per game frame, so both need
+            // the 120Hz mode; everything else wants 60Hz, where the panel's real rate
+            // (59.568) sits far closer to the 3DS's 59.831 than 118.01/2 does.
+            // Frame generation is a SETTING now; checking only the legacy marker file
+            // left the panel at 60Hz while the pacing target assumed 120, which drifts
+            // the emulator ~0.56fps slower than the panel and repeats a frame every
+            // ~1.8s. Check the setting first, marker second.
+            val frameGenOn = BooleanSetting.FRAME_GENERATION.boolean ||
+                java.io.File("/sdcard/Azahar/lsfg/enabled").exists()
+            val needsHighRefresh = java.io.File("/sdcard/Azahar/bfi").exists() || frameGenOn
+            val wanted = if (needsHighRefresh) 120f else 60f
+            val best = display.supportedModes
+                .filter {
+                    it.physicalWidth == current.physicalWidth &&
+                        it.physicalHeight == current.physicalHeight
+                }
+                .minByOrNull { kotlin.math.abs(it.refreshRate - wanted) } ?: return
+            if (kotlin.math.abs(best.refreshRate - wanted) > 5f) return
+            val attributes = window.attributes
+            attributes.preferredDisplayModeId = best.modeId
+            window.attributes = attributes
+            android.util.Log.i(
+                "Azahar",
+                "emulation window pinned to mode ${best.modeId} @ ${best.refreshRate}Hz"
+            )
+        } catch (e: Exception) {
+            android.util.Log.w("Azahar", "could not pin refresh rate: ${e.message}")
+        }
+    }
+
 }
