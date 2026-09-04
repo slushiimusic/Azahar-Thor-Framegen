@@ -64,3 +64,8 @@ GIT-TAG
 
 # verify-release.sh downloads
 verify/
+# Lossless Scaling frame-generation runtime. Lossless Scaling is commercial
+# software; its library and Lossless.dll are NOT redistributable. Users must
+# supply their own copies -- see README-THOR.md.
+src/android/app/src/main/jniLibs/
+*.dll

@@ -8,6 +8,8 @@
 #include "core/frontend/emu_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include <cstdio>
+#include <cstdlib>
 #include "video_core/renderer_vulkan/vk_present_window.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
@@ -111,7 +113,34 @@ PresentWindow::PresentWindow(Frontend::EmuWindow& emu_window_, const Instance& i
       use_present_thread{Settings::values.async_presentation.GetValue()},
       last_render_surface{emu_window.GetWindowInfo().render_surface} {
 
-    const u32 num_images = swapchain.GetImageCount();
+#ifdef ANDROID
+    // Only the main window feeds frame generation. low_refresh_rate is true only
+    // for the secondary (bottom-screen) window in this build.
+    if (!low_refresh_rate) {
+        lsfg_capture = std::make_unique<LsfgCapture>(instance);
+    }
+#endif
+
+    // Black frame insertion is detected here, not later, because it changes how
+    // many Frames we must allocate: it consumes TWO per game frame, and a pool
+    // sized for one starves GetRenderFrame(), which then blocks the emulation
+    // thread on a fence (measured: 26 stalls of 50-76ms per 30s).
+    if (!low_refresh_rate) {
+        if (FILE* f = fopen("/sdcard/Azahar/bfi", "rb")) {
+            char buf[32]{};
+            const size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+            fclose(f);
+            bfi_enabled = true;
+            if (n > 0) {
+                const float parsed = static_cast<float>(atof(buf));
+                if (parsed > 0.0f && parsed <= 1.0f) {
+                    bfi_level = parsed;
+                }
+            }
+        }
+    }
+
+    const u32 num_images = swapchain.GetImageCount() * (bfi_enabled ? 2u : 1u);
     const vk::Device device = instance.GetDevice();
 
     const vk::CommandPoolCreateInfo pool_info = {
@@ -278,6 +307,15 @@ Frame* PresentWindow::GetRenderFrame() {
 void PresentWindow::Present(Frame* frame) {
     if (!use_present_thread) {
         scheduler.WaitWorker();
+        if (bfi_enabled) {
+            // Blank FIRST, then the image. Alternation (and so the persistence
+            // halving) is identical either way, but the failure mode is not: if the
+            // emulator then drops a frame, the last thing presented is the IMAGE,
+            // so the screen holds a picture instead of going black for 60-80ms.
+            Frame* blank = GetRenderFrame();
+            CopyToSwapchain(blank, true);
+            free_queue.push(blank);
+        }
         CopyToSwapchain(frame);
         free_queue.push(frame);
         return;
@@ -345,7 +383,7 @@ void PresentWindow::NotifySurfaceChanged() {
 #endif
 }
 
-void PresentWindow::CopyToSwapchain(Frame* frame) {
+void PresentWindow::CopyToSwapchain(Frame* frame, bool black) {
     const auto recreate_swapchain = [&] {
 #ifdef ANDROID
         {
@@ -434,11 +472,28 @@ void PresentWindow::CopyToSwapchain(Frame* frame) {
         },
     };
 
-    cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
-                           vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
-                           {}, {}, pre_barriers);
+    if (black) {
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+                               vk::PipelineStageFlagBits::eTransfer,
+                               vk::DependencyFlagBits::eByRegion, {}, {}, pre_barriers[0]);
+    } else {
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+                               vk::PipelineStageFlagBits::eTransfer,
+                               vk::DependencyFlagBits::eByRegion, {}, {}, pre_barriers);
+    }
 
-    if (blit_supported) {
+    if (black) {
+        const float lvl = bfi_level;
+        const vk::ClearColorValue kBlack{std::array<float, 4>{lvl, lvl, lvl, 1.0f}};
+        const vk::ImageSubresourceRange range{
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = VK_REMAINING_ARRAY_LAYERS,
+        };
+        cmdbuf.clearColorImage(swapchain_image, vk::ImageLayout::eTransferDstOptimal, kBlack, range);
+    } else if (blit_supported) {
         cmdbuf.blitImage(frame->image, vk::ImageLayout::eTransferSrcOptimal, swapchain_image,
                          vk::ImageLayout::eTransferDstOptimal,
                          MakeImageBlit(frame->width, frame->height, extent.width, extent.height),
@@ -448,6 +503,15 @@ void PresentWindow::CopyToSwapchain(Frame* frame) {
                          vk::ImageLayout::eTransferDstOptimal,
                          MakeImageCopy(frame->width, frame->height, extent.width, extent.height));
     }
+
+#ifdef ANDROID
+    // frame->image is still in eTransferSrcOptimal here, before post_barrier
+    // hands it back, so the capture blit rides along in this same command buffer
+    // and costs no extra submit.
+    if (!black && lsfg_capture && lsfg_capture->IsActive()) {
+        lsfg_capture->RecordCapture(cmdbuf, frame->image, frame->width, frame->height);
+    }
+#endif
 
     cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
                            vk::PipelineStageFlagBits::eAllCommands,
@@ -463,9 +527,12 @@ void PresentWindow::CopyToSwapchain(Frame* frame) {
     const vk::Semaphore present_ready = swapchain.GetPresentReadySemaphore();
     const vk::Semaphore image_acquired = swapchain.GetImageAcquiredSemaphore();
     const std::array wait_semaphores = {image_acquired, frame->render_ready};
+    // A black frame samples no image, and its Frame comes straight off the free
+    // queue with render_ready unsignalled -- waiting on it would deadlock.
+    const u32 wait_count = black ? 1u : static_cast<u32>(wait_semaphores.size());
 
     vk::SubmitInfo submit_info = {
-        .waitSemaphoreCount = static_cast<u32>(wait_semaphores.size()),
+        .waitSemaphoreCount = wait_count,
         .pWaitSemaphores = wait_semaphores.data(),
         .pWaitDstStageMask = wait_stage_masks.data(),
         .commandBufferCount = 1u,
@@ -482,6 +549,12 @@ void PresentWindow::CopyToSwapchain(Frame* frame) {
         LOG_CRITICAL(Render_Vulkan, "Device lost during present submit: {}", err.what());
         UNREACHABLE();
     }
+
+#ifdef ANDROID
+    if (lsfg_capture && lsfg_capture->IsActive()) {
+        lsfg_capture->MarkSubmittedAndDrain(frame->present_done);
+    }
+#endif
 
     swapchain.Present();
 }

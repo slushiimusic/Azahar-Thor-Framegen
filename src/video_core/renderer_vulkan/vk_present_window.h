@@ -8,6 +8,9 @@
 #include <queue>
 #include "common/polyfill_thread.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
+#ifdef ANDROID
+#include "video_core/renderer_vulkan/vk_lsfg_capture.h"
+#endif
 
 VK_DEFINE_HANDLE(VmaAllocation)
 
@@ -52,6 +55,14 @@ public:
     /// Queues the provided frame for presentation.
     void Present(Frame* frame);
 
+    /// Black frame insertion: present a black frame after each real one, halving how
+    /// long an image is held on a sample-and-hold panel. Requires a 120Hz mode.
+    bool bfi_enabled{false};
+
+    /// Blank level, 0.0 = pure black (max motion clarity, max flicker) .. 1.0 = white.
+    /// Raising it toward ~0.2 cuts perceived flicker at some cost in clarity.
+    float bfi_level{0.0f};
+
     /// This is called to notify the rendering backend of a surface change
     void NotifySurfaceChanged();
 
@@ -70,7 +81,7 @@ public:
 private:
     void PresentThread(std::stop_token token);
 
-    void CopyToSwapchain(Frame* frame);
+    void CopyToSwapchain(Frame* frame, bool black = false);
 
     vk::RenderPass CreateRenderpass();
 
@@ -79,6 +90,9 @@ private:
     const Instance& instance;
     Scheduler& scheduler;
     bool low_refresh_rate;
+#ifdef ANDROID
+    std::unique_ptr<LsfgCapture> lsfg_capture;
+#endif
     vk::SurfaceKHR surface;
     vk::SurfaceKHR next_surface{};
     Swapchain swapchain;
