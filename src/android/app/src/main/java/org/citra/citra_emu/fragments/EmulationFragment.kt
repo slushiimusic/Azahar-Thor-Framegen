@@ -71,6 +71,7 @@ import org.citra.citra_emu.display.ScreenLayout
 import org.citra.citra_emu.display.SecondaryDisplayLayout
 import org.citra.citra_emu.features.hotkeys.Hotkey
 import org.citra.citra_emu.features.settings.model.BooleanSetting
+import org.citra.citra_emu.utils.LosslessDll
 import org.citra.citra_emu.features.settings.model.IntSetting
 import org.citra.citra_emu.features.settings.model.SettingsViewModel
 import org.citra.citra_emu.features.settings.ui.SettingsActivity
@@ -230,6 +231,40 @@ class EmulationFragment :
         }
 
         binding.surfaceEmulation.holder.addCallback(this)
+
+        // LSFG frame generation, driven by the Graphics setting. Lossless.dll is a
+        // hard requirement -- LSFG's shaders are extracted from it, so without it the
+        // render loop cannot initialise. The legacy marker file still forces it on for
+        // adb-only testing. The overlay is Z-ordered above the emulation surface; the
+        // render loop presents real + generated frames to it while the emulator keeps
+        // driving surface_emulation underneath.
+        val fgRequested = BooleanSetting.FRAME_GENERATION.boolean ||
+            java.io.File("/sdcard/Azahar/lsfg/enabled").exists()
+        val fgAvailable = LosslessDll.exists()
+        if (fgRequested && fgAvailable) {
+            binding.surfaceLsfg.visibility = View.VISIBLE
+            binding.surfaceLsfg.setZOrderMediaOverlay(true)
+            // The emulator's frame carries alpha=0, so an RGBA overlay composites
+            // as transparent black and merely dims the game underneath. RGBX makes
+            // the compositor ignore alpha and treat LSFG's output as opaque.
+            binding.surfaceLsfg.holder.setFormat(android.graphics.PixelFormat.RGBX_8888)
+            binding.surfaceLsfg.holder.addCallback(object : SurfaceHolder.Callback {
+                override fun surfaceCreated(holder: SurfaceHolder) {}
+
+                override fun surfaceChanged(
+                    holder: SurfaceHolder,
+                    format: Int,
+                    width: Int,
+                    height: Int
+                ) {
+                    NativeLibrary.lsfgSurfaceChanged(holder.surface, width, height)
+                }
+
+                override fun surfaceDestroyed(holder: SurfaceHolder) {
+                    NativeLibrary.lsfgSurfaceDestroyed()
+                }
+            })
+        }
         binding.doneControlConfig.setOnClickListener {
             binding.doneControlConfig.visibility = View.GONE
             binding.surfaceInputOverlay.setIsInEditMode(false)
@@ -1520,6 +1555,14 @@ class EmulationFragment :
                                 (perfStats[timeRem] * 1000.0f).toFloat()
                             )
                         )
+                    }
+
+                    // Frame generation: real (unique) -> on-screen rate and the
+                    // multiplier actually achieved. Empty string when FG is off.
+                    val fgStats = NativeLibrary.lsfgStats()
+                    if (fgStats.isNotEmpty()) {
+                        if (sb.isNotEmpty()) sb.append(dividerString)
+                        sb.append(fgStats)
                     }
 
                     if (BooleanSetting.PERF_OVERLAY_SHOW_SPEED.boolean) {

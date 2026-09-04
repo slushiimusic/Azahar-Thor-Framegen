@@ -180,6 +180,15 @@ object NativeLibrary {
     external fun doFrame()
 
     // Second window
+    /** Hands the LSFG frame-generation overlay surface to the render loop. */
+    external fun lsfgSurfaceChanged(surf: Surface, width: Int, height: Int)
+
+    /** Live frame-generation rates for the overlay; empty until measured. */
+    external fun lsfgStats(): String
+
+    /** Detaches the LSFG overlay surface. */
+    external fun lsfgSurfaceDestroyed()
+
     external fun secondarySurfaceChanged(secondary_surface: Surface)
     external fun secondarySurfaceDestroyed()
 

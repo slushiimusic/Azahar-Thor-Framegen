@@ -93,6 +93,11 @@ public:
         return queue_family_index;
     }
 
+    /// Returns true if AHardwareBuffer memory can be imported (LSFG frame gen).
+    bool IsAndroidAhbImportSupported() const {
+        return android_ahb_import;
+    }
+
     vk::Queue GetGraphicsQueue() const {
         return graphics_queue;
     }
@@ -334,6 +339,8 @@ protected:
     bool fragment_shader_barycentric{};
     bool shader_stencil_export{};
     bool external_memory_host{};
+    /// True when VK_ANDROID_external_memory_android_hardware_buffer is enabled
+    bool android_ahb_import{};
     u64 min_imported_host_pointer_alignment{};
     bool layered_rendering_supported{true};
     bool tooling_info{};

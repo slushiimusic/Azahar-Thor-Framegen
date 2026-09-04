@@ -4,8 +4,21 @@
 
 #include <algorithm>
 #include <codecvt>
+#include <android/choreographer.h>
+#include <android/looper.h>
+#include <array>
 #include <thread>
 #include <dlfcn.h>
+#include <android/native_window_jni.h>
+#include <sys/stat.h>
+
+#include "lsfg_abi.h"
+
+// Declared rather than included: the jni target has no Vulkan headers on its
+// include path, and vk_lsfg_capture.h pulls in vulkan.hpp.
+namespace Vulkan {
+bool LsfgGetStats(double& real_fps, double& out_fps);
+}
 
 #include <android/api-level.h>
 #include <android/native_window_jni.h>
@@ -36,6 +49,7 @@
 #include "common/settings.h"
 #include "common/string_util.h"
 #include "core/core.h"
+#include "core/core_timing.h"
 #include "core/frontend/applets/default_applets.h"
 #include "core/frontend/camera/factory.h"
 #include "core/hle/service/am/am.h"
@@ -72,6 +86,82 @@
 #include "video_core/debug_utils/debug_utils.h"
 #include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
+
+// ---------------------------------------------------------------------------
+// LSFG frame generation: shader bootstrap.
+//
+// liblsfg-android.so ships in the APK and exports its whole control surface as
+// plain C++ symbols, so it is dlopen'd by soname here (inside the app's own
+// linker namespace) rather than from the Vulkan driver. That is deliberate: the
+// driver lives in the adrenotools namespace, and loading LSFG there produces a
+// SECOND mapping whose statics are distinct -- frames get pushed into a context
+// that nothing is presenting, with every counter looking healthy.
+//
+// LSFG's shaders come out of Lossless.dll, extracted to SPIR-V once and cached.
+// ---------------------------------------------------------------------------
+namespace {
+
+void* g_lsfg_handle = nullptr;
+
+void* LsfgSym(const char* name) {
+    return g_lsfg_handle ? dlsym(g_lsfg_handle, name) : nullptr;
+}
+
+void LsfgBootstrapShaders() {
+    if (g_lsfg_handle) {
+        return;
+    }
+    g_lsfg_handle = dlopen("liblsfg-android.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!g_lsfg_handle) {
+        LOG_CRITICAL(Frontend, "LSFG: dlopen failed: {}", dlerror());
+        return;
+    }
+
+    using ExtractFn = int (*)(const std::string&, const std::string&);
+    using ProbeFn = int (*)(const std::string&);
+    auto extract = reinterpret_cast<ExtractFn>(LsfgSym(
+        "_ZN12lsfg_android20extract_dll_to_spirvERKNSt6__ndk112basic_stringIcNS0_11char_traits"
+        "IcEENS0_9allocatorIcEEEES8_"));
+    auto probe = reinterpret_cast<ProbeFn>(LsfgSym(
+        "_ZN12lsfg_android23probe_shaders_on_deviceERKNSt6__ndk112basic_stringIcNS0_11char_traits"
+        "IcEENS0_9allocatorIcEEEE"));
+    if (!extract || !probe) {
+        LOG_CRITICAL(Frontend, "LSFG: missing symbols (extract={} probe={})",
+                     static_cast<void*>(reinterpret_cast<void*>(extract)),
+                     static_cast<void*>(reinterpret_cast<void*>(probe)));
+        return;
+    }
+
+    // User dir first (where the settings picker installs it), Roms as legacy.
+    std::string dll = "/sdcard/Azahar/lsfg/Lossless.dll";
+    if (FILE* probe = fopen(dll.c_str(), "rb")) {
+        fclose(probe);
+    } else {
+        dll = "/sdcard/Roms/Lossless.dll";
+    }
+    const std::string cache = "/sdcard/Azahar/lsfg/shaders";
+    // NOT FileUtil::CreateFullPath: Azahar's FileUtil resolves paths against the
+    // configured user directory, so an absolute path here silently became
+    // <userdir>/sdcard/Azahar/lsfg/shaders and the extractor returned
+    // kErrWriteFailed(-4). We hold MANAGE_EXTERNAL_STORAGE, so mkdir directly.
+    {
+        std::string acc;
+        for (size_t i = 1; i <= cache.size(); ++i) {
+            if (i == cache.size() || cache[i] == '/') {
+                acc = cache.substr(0, i);
+                ::mkdir(acc.c_str(), 0775);
+            }
+        }
+    }
+
+    const int extracted = extract(dll, cache);
+    const int probed = probe(cache);
+    LOG_CRITICAL(Frontend, "LSFG: shader extract={} probe={} (dll={} cache={})", extracted, probed,
+                 dll, cache);
+}
+
+} // namespace
+
 
 namespace {
 
@@ -290,6 +380,10 @@ static Core::System::ResultStatus RunCitra(const std::string& filepath) {
 
     LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Complete, 0, 0, "");
 
+    // Bootstrap LSFG's shaders while the loading UI is still up; extraction is a
+    // one-shot that writes SPIR-V into the cache dir.
+    LsfgBootstrapShaders();
+
     SCOPE_EXIT({ TryShutdown(); });
 
     // Start running emulation
@@ -366,6 +460,163 @@ void InitializeGpuDriver(const std::string& hook_lib_dir, const std::string& cus
 }
 
 extern "C" {
+
+
+
+
+// LSFG render-loop control. Init is deferred until the overlay surface exists so
+// the loop is created once, with a known capture size.
+namespace {
+
+bool g_lsfg_inited = false;
+ANativeWindow* g_lsfg_window = nullptr;
+u32 g_lsfg_capture_w = 0;
+u32 g_lsfg_capture_h = 0;
+
+using InitFn = int (*)(const char*, const lsfg_android::RenderLoopConfig&);
+using SetSurfaceFn = void (*)(ANativeWindow*, uint32_t, uint32_t);
+using ShutdownFn = void (*)();
+
+void LsfgStart(JNIEnv* env, ANativeWindow* win, u32 out_w, u32 out_h) {
+    LsfgBootstrapShaders();
+    if (!g_lsfg_handle) {
+        return;
+    }
+    auto init = reinterpret_cast<InitFn>(
+        LsfgSym("_ZN12lsfg_android14initRenderLoopEPKcRKNS_16RenderLoopConfigE"));
+    auto set_surface = reinterpret_cast<SetSurfaceFn>(
+        LsfgSym("_ZN12lsfg_android16setOutputSurfaceEP13ANativeWindowjj"));
+    if (!init || !set_surface) {
+        LOG_CRITICAL(Frontend, "LSFG: render loop symbols missing");
+        return;
+    }
+
+    if (!g_lsfg_inited) {
+        // Capture resolution must match vk_lsfg_capture.cpp exactly or LSFG copies
+        // the buffer 1:1 and crops. Same file, same default (full 1080p): lower
+        // values are cheaper per generated frame but visibly softer, since the
+        // output is scaled up to the overlay.
+        g_lsfg_capture_w = 1920;
+        g_lsfg_capture_h = 1080;
+        if (FILE* cf = fopen("/sdcard/Azahar/lsfg/capture", "rb")) {
+            char buf[64]{};
+            const size_t n = fread(buf, 1, sizeof(buf) - 1, cf);
+            fclose(cf);
+            unsigned pw = 0;
+            unsigned ph = 0;
+            if (n > 0 && sscanf(buf, "%ux%u", &pw, &ph) == 2 && pw >= 256 && ph >= 224) {
+                g_lsfg_capture_w = pw & ~1u;
+                g_lsfg_capture_h = ph & ~1u;
+            }
+        }
+
+        lsfg_android::RenderLoopConfig cfg{};
+        cfg.width = g_lsfg_capture_w;
+        cfg.height = g_lsfg_capture_h;
+        cfg.multiplier = 2;
+        cfg.flowScale = 1.0f;
+        cfg.performance = !Settings::values.frame_gen_quality.GetValue();
+        cfg.hdr = false;
+        cfg.antiArtifacts = Settings::values.frame_gen_quality.GetValue();
+        cfg.framegenFp16 = false;
+        cfg.npuPostProcessing = false;
+        cfg.npuPreset = 0;
+        cfg.npuUpscaleFactor = 1;
+        cfg.npuAmount = 0.0f;
+        cfg.npuRadius = 1.0f;
+        cfg.npuThreshold = 0.0f;
+        cfg.npuFp16 = false;
+        cfg.cpuPostProcessing = false;
+        cfg.cpuPreset = 0;
+        cfg.cpuStrength = 0.0f;
+        cfg.cpuSaturation = 0.5f;
+        cfg.cpuVibrance = 0.0f;
+        cfg.cpuVignette = 0.0f;
+        cfg.gpuPostProcessing = false;
+        cfg.gpuStage = 0;
+        cfg.gpuMethod = 0;
+        cfg.gpuUpscaleFactor = 1.0f;
+        cfg.gpuSharpness = 0.0f;
+        cfg.gpuStrength = 0.0f;
+        cfg.targetFpsCap = 0;
+        cfg.emaAlpha = 0.125f;
+        cfg.outlierRatio = 4.0f;
+        cfg.vsyncSlackMs = 2.0f;
+        cfg.queueDepth = 4;
+
+        const int rc = init("/sdcard/Azahar/lsfg/shaders", cfg);
+        // 0 = ok, 1 = initialised but framegen disabled (mirror mode).
+        LOG_CRITICAL(Frontend, "LSFG: initRenderLoop rc={} capture={}x{} out={}x{}", rc,
+                     g_lsfg_capture_w, g_lsfg_capture_h, out_w, out_h);
+        if (rc < 0) {
+            return;
+        }
+        g_lsfg_inited = true;
+    }
+
+    // Diagnostic: /sdcard/Azahar/lsfg/bypass makes the render loop blit the latest
+    // capture straight to the overlay with NO interpolation. If the stalls survive
+    // that, they are in LSFG's presentation path (surface/compositor), not framegen.
+    // setBypass has no C++ export -- only the JNI wrapper, which is an ordinary
+    // exported C function that ignores `thiz`.
+    if (FILE* bf = fopen("/sdcard/Azahar/lsfg/bypass", "rb")) {
+        fclose(bf);
+        using BypassFn = void (*)(JNIEnv*, jobject, jboolean);
+        auto bypass = reinterpret_cast<BypassFn>(
+            LsfgSym("Java_com_lsfg_android_session_NativeBridge_setBypass"));
+        if (bypass) {
+            bypass(env, nullptr, JNI_TRUE);
+            LOG_CRITICAL(Frontend, "LSFG: BYPASS ENABLED (no interpolation, blit only)");
+        } else {
+            LOG_CRITICAL(Frontend, "LSFG: setBypass symbol missing");
+        }
+    }
+
+    set_surface(win, out_w, out_h);
+    g_lsfg_window = win;
+    LOG_CRITICAL(Frontend, "LSFG: output surface attached {}x{}", out_w, out_h);
+}
+
+} // namespace
+
+
+jstring Java_org_citra_citra_1emu_NativeLibrary_lsfgStats(JNIEnv* env,
+                                                          [[maybe_unused]] jobject obj) {
+    double real_fps = 0.0;
+    double out_fps = 0.0;
+    if (!Vulkan::LsfgGetStats(real_fps, out_fps)) {
+        return env->NewStringUTF("");
+    }
+    const double ratio = real_fps > 0.1 ? out_fps / real_fps : 0.0;
+    // real = unique captures (the emulator's true new-frame rate; LSFG dedups
+    // static frames), out = what actually reaches the overlay.
+    const std::string text =
+        fmt::format("FG:\u00A0{:.0f}\u2192{:.0f}\u00A0({:.2f}x)", real_fps, out_fps, ratio);
+    return env->NewStringUTF(text.c_str());
+}
+
+void Java_org_citra_citra_1emu_NativeLibrary_lsfgSurfaceChanged(JNIEnv* env,
+                                                                [[maybe_unused]] jobject obj,
+                                                                jobject surf, jint width,
+                                                                jint height) {
+    ANativeWindow* win = ANativeWindow_fromSurface(env, surf);
+    if (!win) {
+        LOG_CRITICAL(Frontend, "LSFG: ANativeWindow_fromSurface returned null");
+        return;
+    }
+    LsfgStart(env, win, static_cast<u32>(width), static_cast<u32>(height));
+}
+
+void Java_org_citra_citra_1emu_NativeLibrary_lsfgSurfaceDestroyed(
+    [[maybe_unused]] JNIEnv* env, [[maybe_unused]] jobject obj) {
+    auto set_surface = reinterpret_cast<SetSurfaceFn>(
+        LsfgSym("_ZN12lsfg_android16setOutputSurfaceEP13ANativeWindowjj"));
+    if (set_surface) {
+        set_surface(nullptr, 0, 0);
+    }
+    g_lsfg_window = nullptr;
+    LOG_CRITICAL(Frontend, "LSFG: output surface detached");
+}
 
 void Java_org_citra_citra_1emu_NativeLibrary_surfaceChanged(JNIEnv* env,
                                                             [[maybe_unused]] jobject obj,
@@ -967,6 +1218,181 @@ jdoubleArray Java_org_citra_citra_1emu_NativeLibrary_getPerfStats(JNIEnv* env,
     return j_stats;
 }
 
+
+// Pace the emulator to the PANEL's true refresh rate instead of the 3DS's
+// 59.8261 Hz. The Thor's panel reports 60/120 Hz but actually scans at ~59.56 /
+// ~119.1 Hz, so at 120 Hz the emulator drifts against it and frames land on 1 or
+// 3 refreshes instead of 2. Writing a target fps to /sdcard/Azahar/fps_target
+// (e.g. "59.55") retargets the frame limiter with sub-percent precision --
+// Settings::temporary_frame_limit is a double, unlike the integer frame_limit
+// setting, whose 99%/100% steps straddle the value we need.
+
+// ---------------------------------------------------------------------------
+// Closed-loop vsync pacing.
+//
+// A hand-measured constant in fps_target is right the moment it is taken and
+// slowly wrong afterwards: the panel's clock and the emulator's wall clock are
+// independent, so they drift, and a fixed target eventually skips or repeats a
+// frame again. This locks onto the real signal instead -- AChoreographer hands
+// us actual vsync timestamps, so the pace self-corrects and needs no constant.
+//
+// fps_target still wins when present, as a manual override.
+// ---------------------------------------------------------------------------
+std::atomic<bool> g_manual_target{false};
+
+struct VsyncTracker {
+    static constexpr size_t kWindow = 240;  // ~4s at 60Hz
+    std::array<int64_t, kWindow> samples{};
+    size_t count = 0;
+    size_t head = 0;
+
+    void Add(int64_t t) {
+        samples[head] = t;
+        head = (head + 1) % kWindow;
+        if (count < kWindow) {
+            count++;
+        }
+    }
+
+    // Vsync period in ns from the oldest..newest span, which averages away the
+    // per-callback jitter that a consecutive-delta mean would keep.
+    double PeriodNs() const {
+        if (count < 30) {
+            return 0.0;
+        }
+        const size_t oldest = (head + kWindow - count) % kWindow;
+        const size_t newest = (head + kWindow - 1) % kWindow;
+        const int64_t span = samples[newest] - samples[oldest];
+        return span <= 0 ? 0.0 : static_cast<double>(span) / static_cast<double>(count - 1);
+    }
+};
+
+VsyncTracker g_vsync;
+std::atomic<bool> g_vsync_running{false};
+
+void VsyncCallback(long frameTimeNanos, void* data) {
+    g_vsync.Add(static_cast<int64_t>(frameTimeNanos));
+    AChoreographer_postFrameCallback(AChoreographer_getInstance(), VsyncCallback, data);
+}
+
+void StartVsyncPacer() {
+    if (g_vsync_running.exchange(true)) {
+        return;
+    }
+    std::thread([] {
+        ALooper* looper = ALooper_prepare(ALOOPER_PREPARE_ALLOW_NON_CALLBACKS);
+        if (!looper) {
+            LOG_CRITICAL(Frontend, "vsync pacer: no looper");
+            return;
+        }
+        AChoreographer* ch = AChoreographer_getInstance();
+        if (!ch) {
+            LOG_CRITICAL(Frontend, "vsync pacer: no choreographer");
+            return;
+        }
+        AChoreographer_postFrameCallback(ch, VsyncCallback, nullptr);
+
+        int64_t last_log = 0;
+        while (true) {
+            // Drive the callbacks, then reassess roughly twice a second.
+            ALooper_pollOnce(500, nullptr, nullptr, nullptr);
+
+            // A manual fps_target overrides the closed loop entirely.
+            if (Settings::display_sync_limit > 0.0 && g_manual_target) {
+                continue;
+            }
+            const double period_ns = g_vsync.PeriodNs();
+            if (period_ns <= 0.0) {
+                continue;
+            }
+            const double panel_hz = 1e9 / period_ns;
+            // Present every Nth refresh, N chosen so the result sits nearest the
+            // 3DS's own rate: 1 at 60Hz, 2 at 120Hz.
+            const double n = std::max(1.0, std::round(panel_hz / SCREEN_REFRESH_RATE));
+            const double target = panel_hz / n;
+            if (target < 50.0 || target > 70.0) {
+                continue;
+            }
+            Settings::display_sync_limit = 100.0 * target / SCREEN_REFRESH_RATE;
+            const int64_t now = g_vsync.samples[(g_vsync.head + VsyncTracker::kWindow - 1) %
+                                                VsyncTracker::kWindow];
+            if (now - last_log > 10000000000LL) {
+                last_log = now;
+                LOG_CRITICAL(Frontend,
+                             "vsync pacer: panel {:.5f}Hz /{:.0f} -> target {:.5f} fps ({:.4f}%)",
+                             panel_hz, n, target, Settings::display_sync_limit);
+            }
+        }
+    }).detach();
+}
+
+std::atomic<bool> g_sync_poll_running{false};
+
+// Re-read the target every 2s on a helper thread so it can be tuned live with a
+// single adb write -- no rebuild, no restart. Deliberately NOT on the emulation
+// thread: this user dir is on FUSE-backed storage and a stat there is not free.
+void StartDisplaySyncPoller() {
+    if (g_sync_poll_running.exchange(true)) {
+        return;
+    }
+    std::thread([] {
+        double last = -1.0;
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            FILE* f = fopen("/sdcard/Azahar/fps_target", "rb");
+            if (!f) {
+                if (g_manual_target) {
+                    g_manual_target = false;
+                    LOG_CRITICAL(Frontend, "display sync: target cleared");
+                }
+                last = -1.0;
+                continue;
+            }
+            char buf[64]{};
+            const size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+            fclose(f);
+            if (n == 0) {
+                continue;
+            }
+            const double fps = atof(buf);
+            if (fps < 50.0 || fps > 70.0 || fps == last) {
+                continue;
+            }
+            last = fps;
+            g_manual_target = true;
+            Settings::display_sync_limit = 100.0 * fps / SCREEN_REFRESH_RATE;
+            LOG_CRITICAL(Frontend, "display sync: retuned to {:.4f} fps ({:.4f}%)", fps,
+                         Settings::display_sync_limit);
+        }
+    }).detach();
+}
+
+void ApplyDisplaySyncTarget() {
+    Settings::display_sync_limit = 0.0;
+    FILE* f = fopen("/sdcard/Azahar/fps_target", "rb");
+    if (!f) {
+        return;
+    }
+    char buf[64]{};
+    const size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == 0) {
+        return;
+    }
+    const double target_fps = atof(buf);
+    // Guard: only accept rates near the 3DS's own, so a stray file cannot make
+    // the emulator run at a wildly wrong speed.
+    if (target_fps < 50.0 || target_fps > 70.0) {
+        LOG_CRITICAL(Frontend, "fps_target {} out of range, ignoring", target_fps);
+        return;
+    }
+    const double pct = 100.0 * target_fps / SCREEN_REFRESH_RATE;
+    g_manual_target = true;
+    Settings::display_sync_limit = pct;
+    LOG_CRITICAL(Frontend, "display sync: target {:.4f} fps -> frame_limit {:.4f}% (native {:.4f})",
+                 target_fps, pct, SCREEN_REFRESH_RATE);
+}
+
 void Java_org_citra_citra_1emu_NativeLibrary_run__Ljava_lang_String_2(JNIEnv* env,
                                                                       [[maybe_unused]] jobject obj,
                                                                       jstring j_path) {
@@ -976,6 +1402,9 @@ void Java_org_citra_citra_1emu_NativeLibrary_run__Ljava_lang_String_2(JNIEnv* en
         stop_run = true;
         running_cv.notify_all();
     }
+
+    ApplyDisplaySyncTarget();
+    StartDisplaySyncPoller();
 
     const Core::System::ResultStatus result{RunCitra(path)};
     if (result != Core::System::ResultStatus::Success) {

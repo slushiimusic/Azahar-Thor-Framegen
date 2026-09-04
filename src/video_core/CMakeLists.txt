@@ -185,6 +185,8 @@ if (ENABLE_VULKAN)
         renderer_vulkan/vk_pipeline_cache.h
         $<$<NOT:$<BOOL:${ENABLE_LIBRETRO}>>:renderer_vulkan/vk_platform.cpp>
         renderer_vulkan/vk_platform.h
+        $<$<BOOL:${ANDROID}>:renderer_vulkan/vk_lsfg_capture.cpp>
+        $<$<BOOL:${ANDROID}>:renderer_vulkan/vk_lsfg_capture.h>
         $<$<NOT:$<BOOL:${ENABLE_LIBRETRO}>>:renderer_vulkan/vk_present_window.cpp>
         $<$<NOT:$<BOOL:${ENABLE_LIBRETRO}>>:renderer_vulkan/vk_present_window.h>
         renderer_vulkan/vk_render_manager.cpp
@@ -203,6 +205,10 @@ if (ENABLE_VULKAN)
         shader/generator/spv_fs_shader_gen.h
     )
     target_link_libraries(video_core PRIVATE vulkan-headers vma sirit SPIRV glslang)
+    if (ANDROID)
+        # AHardwareBuffer_allocate/_release for the LSFG frame-generation capture.
+        target_link_libraries(video_core PRIVATE android)
+    endif()
 endif()
 
 if(ENABLE_SDL2)

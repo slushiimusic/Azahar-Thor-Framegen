@@ -38,6 +38,11 @@ void Swapchain::Create(u32 width_, u32 height_, vk::SurfaceKHR surface_, bool lo
     Destroy();
 
     SetPresentMode();
+    // LOG_CRITICAL so it survives log_filter=*:Critical. Proves which present
+    // mode each window actually got; the Thor dual-screen fix depends on the
+    // secondary being MAILBOX rather than FIFO.
+    LOG_CRITICAL(Render_Vulkan, "swapchain {}x{} low_refresh_rate={} present_mode={}", width,
+                 height, low_refresh_rate, vk::to_string(present_mode));
     if (needs_recreation) {
         return;
     }

@@ -420,7 +420,7 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 13> enabled_extensions;
+    boost::container::static_vector<const char*, 20> enabled_extensions;
     const auto add_extension = [&](std::string_view extension, bool blacklist = false,
                                    std::string_view reason = "") -> bool {
         const auto result =
@@ -448,6 +448,16 @@ bool Instance::CreateDevice() {
     const bool is_turnip = driver_id == vk::DriverIdKHR::eMesaTurnip;
 
     add_extension(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+#ifdef ANDROID
+    // LSFG frame generation consumes the emulator's rendered frame as an
+    // AHardwareBuffer. VK_EXT_queue_family_foreign is a hard dependency of the
+    // AHB extension; the rest of its deps are core in Vulkan 1.1.
+    android_ahb_import = add_extension("VK_EXT_queue_family_foreign") &&
+                         add_extension(
+                             "VK_ANDROID_external_memory_android_hardware_buffer");
+    LOG_CRITICAL(Render_Vulkan, "LSFG: AHardwareBuffer import extension enabled={}",
+                 android_ahb_import);
+#endif
     image_format_list = add_extension(VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME);
     shader_stencil_export = add_extension(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
     external_memory_host = add_extension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);

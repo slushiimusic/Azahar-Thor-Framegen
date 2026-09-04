@@ -21,6 +21,19 @@
             android:focusable="false"
             android:focusableInTouchMode="false" />
 
+        <!-- LSFG frame-generation output. Sits above the emulation surface and
+             below the input overlay: the render loop presents real + generated
+             frames here while the emulator keeps driving surface_emulation. -->
+        <SurfaceView
+            android:id="@+id/surface_lsfg"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:layout_gravity="center"
+            android:defaultFocusHighlightEnabled="false"
+            android:focusable="false"
+            android:focusableInTouchMode="false"
+            android:visibility="gone" />
+
         <!-- This is the onscreen input overlay -->
         <org.citra.citra_emu.overlay.InputOverlay
             android:id="@+id/surface_input_overlay"
