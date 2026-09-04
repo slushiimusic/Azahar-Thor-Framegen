@@ -37,6 +37,8 @@ foreach(KEY IN ITEMS
     "spirv_shader_gen"
     "disable_spirv_optimizer"
     "async_shader_compilation"
+    "frame_generation"
+    "frame_gen_quality"
     "async_presentation"
     "use_hw_shader"
     "use_disk_shader_cache"

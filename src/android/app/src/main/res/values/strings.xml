@@ -269,6 +269,14 @@
     <string name="disable_spirv_optimizer">Disable SPIR-V Optimizer</string>
     <string name="disable_spirv_optimizer_description">Disables the SPIR-V optimization pass, reducing stuttering considerably while barely affecting performance.</string>
     <string name="async_shaders">Enable Asynchronous Shader Compilation</string>
+    <string name="frame_generation">Frame Generation</string>
+    <string name="frame_generation_description">Generates an interpolated frame between each rendered frame, doubling on-screen frame rate. Greatly improves motion clarity. Menus and UI screens may show interpolation artifacts</string>
+    <string name="frame_generation_needs_dll">Requires Lossless.dll in your Roms folder (/sdcard/Roms/Lossless.dll)</string>
+    <string name="frame_generation_select_dll">Requires Lossless.dll. Tap to select it — it will be copied into your Azahar user folder</string>
+    <string name="frame_generation_dll_installed">Lossless.dll installed. Frame Generation is now available</string>
+    <string name="frame_generation_dll_failed">Could not read that file. Select Lossless.dll</string>
+    <string name="frame_gen_quality">Frame Generation Quality Mode</string>
+    <string name="frame_gen_quality_description">Reduces interpolation artifacts at the cost of extra GPU load. Turn on if menus or fast motion look warped</string>
     <string name="async_shaders_description">Compiles shaders in the background to reduce stuttering during gameplay. When enabled expect temporary graphical glitches</string>
     <string name="linear_filtering">Linear Filtering</string>
     <string name="linear_filtering_description">Enables linear filtering, which causes game visuals to appear smoother.</string>

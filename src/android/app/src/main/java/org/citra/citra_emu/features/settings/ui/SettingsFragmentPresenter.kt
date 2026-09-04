@@ -37,6 +37,7 @@ import org.citra.citra_emu.features.settings.model.view.HeaderSetting
 import org.citra.citra_emu.features.settings.model.view.InputBindingSetting
 import org.citra.citra_emu.features.settings.model.view.MultiChoiceSetting
 import org.citra.citra_emu.features.settings.model.view.RunnableSetting
+import org.citra.citra_emu.utils.LosslessDll
 import org.citra.citra_emu.features.settings.model.view.SettingsItem
 import org.citra.citra_emu.features.settings.model.view.SingleChoiceSetting
 import org.citra.citra_emu.features.settings.model.view.SliderSetting
@@ -985,6 +986,41 @@ class SettingsFragmentPresenter(private val fragmentView: SettingsFragmentView) 
                     BooleanSetting.ASYNC_SHADERS.defaultValue
                 )
             )
+            // Frame generation. Gated on Lossless.dll, which LSFG's shaders are
+            // extracted from -- without it the render loop cannot initialise. When it
+            // is missing we offer a picker rather than a dead toggle, so the feature
+            // is self-servicing instead of telling the user to go find a path.
+            val losslessDll = LosslessDll.exists()
+            if (losslessDll) {
+                add(
+                    SwitchSetting(
+                        BooleanSetting.FRAME_GENERATION,
+                        R.string.frame_generation,
+                        R.string.frame_generation_description,
+                        BooleanSetting.FRAME_GENERATION.key,
+                        BooleanSetting.FRAME_GENERATION.defaultValue
+                    )
+                )
+                add(
+                    SwitchSetting(
+                        BooleanSetting.FRAME_GEN_QUALITY,
+                        R.string.frame_gen_quality,
+                        R.string.frame_gen_quality_description,
+                        BooleanSetting.FRAME_GEN_QUALITY.key,
+                        BooleanSetting.FRAME_GEN_QUALITY.defaultValue
+                    )
+                )
+            } else {
+                add(
+                    RunnableSetting(
+                        R.string.frame_generation,
+                        R.string.frame_generation_select_dll,
+                        true,
+                        0,
+                        { settingsActivity.selectLosslessDll.launch(arrayOf("*/*")) }
+                    )
+                )
+            }
             add(
                 SingleChoiceSetting(
                     IntSetting.RESOLUTION_FACTOR,

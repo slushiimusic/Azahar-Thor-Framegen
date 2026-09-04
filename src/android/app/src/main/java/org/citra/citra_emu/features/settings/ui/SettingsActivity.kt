@@ -13,6 +13,7 @@ import android.view.ViewGroup.MarginLayoutParams
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
@@ -36,6 +37,7 @@ import org.citra.citra_emu.features.settings.model.StringSetting
 import org.citra.citra_emu.features.settings.utils.SettingsFile
 import org.citra.citra_emu.utils.DirectoryInitialization
 import org.citra.citra_emu.utils.InsetsHelper
+import org.citra.citra_emu.utils.LosslessDll
 import org.citra.citra_emu.utils.RefreshRateUtil
 import org.citra.citra_emu.utils.SystemSaveGame
 import org.citra.citra_emu.utils.ThemeUtil
@@ -50,6 +52,28 @@ class SettingsActivity :
     private val settingsViewModel: SettingsViewModel by viewModels()
 
     override val settings: Settings get() = settingsViewModel.settings
+
+    /**
+     * Picker for Lossless.dll, which frame generation cannot start without. The file
+     * is copied into the Azahar user directory so it survives independently of the
+     * user's Roms folder. Registered here (not in the fragment) because the settings
+     * list is rebuilt as the user navigates and a fragment-scoped launcher would be
+     * torn down mid-flight.
+     */
+    val selectLosslessDll: ActivityResultLauncher<Array<String>> =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { result: Uri? ->
+            if (result == null) {
+                return@registerForActivityResult
+            }
+            if (LosslessDll.install(result)) {
+                Toast.makeText(this, R.string.frame_generation_dll_installed, Toast.LENGTH_LONG)
+                    .show()
+                // Rebuild the list so the picker row becomes the real toggles.
+                settingsFragment?.loadSettingsList()
+            } else {
+                Toast.makeText(this, R.string.frame_generation_dll_failed, Toast.LENGTH_LONG).show()
+            }
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         RefreshRateUtil.enforceRefreshRate(this)

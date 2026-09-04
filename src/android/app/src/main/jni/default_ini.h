@@ -101,6 +101,14 @@ static const char* android_config_default_file_content = (BOOST_HANA_STRING(R"(
 # 0: Off, 1: On (default)
 )") DECLARE_KEY(async_shader_compilation) BOOST_HANA_STRING(R"(
 
+# Frame generation (LSFG). Requires Lossless.dll in the Roms folder.
+# 0 (default): Off, 1: On
+)") DECLARE_KEY(frame_generation) BOOST_HANA_STRING(R"(
+
+# Higher-quality frame generation: fewer artifacts, more GPU cost.
+# 0 (default): Performance, 1: Quality
+)") DECLARE_KEY(frame_gen_quality) BOOST_HANA_STRING(R"(
+
 # Whether to emit PICA fragment shader using SPIRV or GLSL (Vulkan only)
 # 0: GLSL, 1: SPIR-V (default)
 )") DECLARE_KEY(spirv_shader_gen) BOOST_HANA_STRING(R"(
