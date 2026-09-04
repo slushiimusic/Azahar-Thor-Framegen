@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <chrono>
 #include <boost/container/static_vector.hpp>
 
 #include "common/common_paths.h"
@@ -84,9 +85,13 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              RenderManager& renderpass_cache_, DescriptorUpdateQueue& update_queue_)
     : instance{instance_}, scheduler{scheduler_}, renderpass_cache{renderpass_cache_},
       update_queue{update_queue_},
-      num_worker_threads{std::max(std::thread::hardware_concurrency(), 2U) / 2},
-      pipeline_workers{num_worker_threads, "Pipeline workers"},
-      shader_workers{num_worker_threads, "Shader workers"},
+      // Was hardware_concurrency/2 (4 of 8 cores here). Since LoadCache now blocks
+      // boot until the compile queues drain, halving the pool directly doubled that
+      // wait; and the workers are ThreadPriority::Low, so during gameplay they fill
+      // idle cores instead of preempting the emulation thread. Use every core.
+      num_worker_threads{std::max(std::thread::hardware_concurrency(), 2U)},
+      pipeline_workers{num_worker_threads, "Pipeline workers", {}, Common::ThreadPriority::Low},
+      shader_workers{num_worker_threads, "Shader workers", {}, Common::ThreadPriority::Low},
       descriptor_heaps{
           DescriptorHeap{instance, scheduler.GetMasterSemaphore(), BUFFER_BINDINGS, 32},
           DescriptorHeap{instance, scheduler.GetMasterSemaphore(), TEXTURE_BINDINGS<1>},
@@ -154,6 +159,24 @@ void PipelineCache::LoadCache(const std::atomic_bool& stop_loading,
                               const VideoCore::DiskResourceLoadCallback& callback) {
     LoadDriverPipelineDiskCache(stop_loading, callback);
     LoadDiskCache(stop_loading, callback);
+
+    // Drain the compile queues before emulation starts. LoadDiskCache queues every
+    // cached pipeline to the workers via TryBuild(false) and then returns, so the
+    // caller (android jni native.cpp: LoadDefaultDiskResources -> RunLoop) began
+    // emulating while four unprioritised worker threads were still compiling.
+    // Measured on an AYN Thor: a burst of whole dropped frames through the first
+    // ~33 s of play, then 99 s completely clean. The DiskShaderCacheProgress UI is
+    // still on screen here, so waiting turns an in-game stutter burst into visible
+    // loading time instead.
+    const auto t0 = std::chrono::steady_clock::now();
+    pipeline_workers.WaitForRequests();
+    shader_workers.WaitForRequests();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    // Critical so it survives log_filter=*:Critical; this is the cache warm-up cost.
+    LOG_CRITICAL(Render_Vulkan, "pipeline warm-up drained in {} ms using {} worker threads",
+                 ms, num_worker_threads);
 }
 
 void PipelineCache::SwitchCache(u64 title_id, const std::atomic_bool& stop_loading,

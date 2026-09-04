@@ -37,10 +37,19 @@ class StatefulThreadWorker {
 
 public:
     explicit StatefulThreadWorker(std::size_t num_workers, std::string_view name,
-                                  StateMaker func = {})
+                                  StateMaker func = {},
+                                  ThreadPriority priority = ThreadPriority::Normal)
         : workers_queued{num_workers}, thread_name{name} {
-        const auto lambda = [this, func](std::stop_token stop_token, std::size_t index) {
+        const auto lambda = [this, func, priority](std::stop_token stop_token, std::size_t index) {
             Common::SetCurrentThreadName(thread_name.data());
+            // Shader/pipeline compilation spawns hardware_concurrency/2 threads for
+            // EACH of two workers (8 on an 8-core SoC) at default priority, so a
+            // compile burst preempts the emulation and render threads and drops
+            // frames even when nothing is blocking on the compile. Let callers
+            // demote them so the emulator wins the CPU.
+            if (priority != ThreadPriority::Normal) {
+                Common::SetCurrentThreadPriority(priority);
+            }
             {
                 [[maybe_unused]] std::conditional_t<with_state, StateType, int> state{func(index)};
                 while (!stop_token.stop_requested()) {
