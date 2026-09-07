@@ -32,16 +32,23 @@ dropped              2 captures in 156,601
 ## Frame generation requires Lossless.dll
 
 LSFG extracts its shaders from `Lossless.dll`, which ships with
-[Lossless Scaling](https://store.steampowered.com/app/993090/Lossless_Scaling/) —
-commercial software. **Neither it nor `liblsfg-android.so` is redistributable, so
-neither is in this repository.** Supply your own copies:
+[Lossless Scaling](https://store.steampowered.com/app/993090/Lossless_Scaling/),
+commercial software. **`Lossless.dll` is not redistributable and is never
+included**, in this repository or in any build. Pick it via Graphics → Frame
+Generation, which copies it into the Azahar user directory.
 
-- `liblsfg-android.so` → `src/android/app/src/main/jniLibs/arm64-v8a/`
-- `Lossless.dll` → pick it via Graphics → Frame Generation, which copies it into
-  the Azahar user directory.
+Without it the Frame Generation toggle stays disabled and shows the reason, and
+the capture never arms, so the emulator behaves exactly like upstream.
 
-Without them, the Frame Generation toggle shows as disabled with the reason, and
-the capture never arms — the emulator behaves exactly like upstream.
+### `liblsfg-android.so`
+
+Not in this repository either. Where you get it depends on how you install:
+
+- **Prebuilt APK** (see Releases): the library is bundled, so frame generation
+  works as soon as you supply `Lossless.dll`.
+- **Building from source**: drop your own copy into
+  `src/android/app/src/main/jniLibs/arm64-v8a/` before building. Without it the
+  build succeeds and frame generation reports itself unavailable.
 
 ## Building
 
@@ -104,5 +111,8 @@ trades the latency for roughly 64 amplitude-freeze discontinuities per second.
 
 ## Licence
 
-GPLv2, same as [Azahar](https://github.com/azahar-emu/azahar). Lossless Scaling
-components are not included and remain the property of their authors.
+GPLv2, same as [Azahar](https://github.com/azahar-emu/azahar).
+
+`Lossless.dll` is never included and remains the property of its authors. The
+prebuilt APK on the Releases page does bundle `liblsfg-android.so`; the source
+tree does not, so a source build needs you to supply it.
